@@ -54,10 +54,13 @@ export function attachPlaceSearch({ form, input, results, app }) {
     }
   });
   input.addEventListener('keydown', (e) => {
-    if (results.classList.contains('hidden') || !items.length) { if (e.key === 'Escape') input.blur(); return; }
+    if (e.key === 'Escape') {   // closes the list, including 'Searching…' (the late answer is then ignored); a second Escape leaves the box
+      if (results.classList.contains('hidden')) input.blur(); else close();
+      return;
+    }
+    if (results.classList.contains('hidden') || !items.length) return;
     if (e.key === 'ArrowDown') { e.preventDefault(); active = (active + 1) % items.length; highlight(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); active = (active - 1 + items.length) % items.length; highlight(); }
-    else if (e.key === 'Escape') close();
   });
   input.addEventListener('input', () => { if (input.value.trim().replace(/\s+/g, ' ') !== lastQuery) close(); });
   results.addEventListener('click', (e) => { const r = e.target.closest('[data-pi]'); if (r) choose(items[Number(r.dataset.pi)]); });

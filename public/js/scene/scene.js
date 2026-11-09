@@ -509,7 +509,8 @@ export class SceneView {
   flyToSurface(dist = 0.95) {
     if (!this.obsLocal) return;
     if (this.mode === 'sky') this.setMode('orbital');
-    const getPos = () => this.obsLocal.clone().applyMatrix4(this.earth.matrixWorld);
+    const local = this.obsLocal.clone();   // fixed to this place even if the observer moves later
+    const getPos = () => local.clone().applyMatrix4(this.earth.matrixWorld);
     // looking down, tilted 20° toward the equator — stored Earth-fixed so it turns with the place
     const dirLocal = this.enuLocal.U.clone().multiplyScalar(0.94).addScaledVector(this.enuLocal.N, -0.34).normalize();
     const fromDir = this.camera.position.clone().sub(this.controls.target).normalize();
@@ -592,7 +593,10 @@ export class SceneView {
     }
     l.getPos = getPos;
     if (l.text !== text || l.color !== color) {
-      l.el.innerHTML = color ? `<i class="sw" style="background:${color}"></i>${text}` : text;
+      // built from nodes, never innerHTML: names come from OpenStreetMap, CelesTrak and saved settings
+      l.el.textContent = '';
+      if (color) { const sw = document.createElement('i'); sw.className = 'sw'; sw.style.background = color; l.el.appendChild(sw); }
+      l.el.appendChild(document.createTextNode(String(text)));
       l.text = text; l.color = color;
     }
     l.el.className = `label ${cls}`;

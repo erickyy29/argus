@@ -176,7 +176,8 @@ export class Drawer {
       <div class="list" style="margin-top:8px">${L.length ? rows.map(([c, i]) => `<div class="row conj" data-cj="${i}" title="Replay this encounter in 3D">
           <div class="pc ${c.prob >= PC_RED ? 'p4' : c.prob >= PC_AMBER ? 'p5' : 'p6'}">${fmt.pc(c.prob)}</div>
           <div style="min-width:0"><div class="t pair"><span class="n">${esc(c.n1)}</span><span class="x">↔</span><span class="n">${esc(c.n2)}</span></div>
-            <div class="m">${fmt.localFull(c.t)} · ${fmt.rel(c.t, now)} · ${compass(c.az)} ${fmt.deg(c.el, 0)} · ${fmt.int(c.altKm)} km up${c.observable ? ' · <span class="badge obs">observable</span>' : ''}</div></div>
+            <div class="m">${compass(c.az)} ${fmt.deg(c.el, 0)} · ${fmt.int(c.altKm)} km up${c.observable ? ' <span class="badge obs">observable</span>' : ''}</div>
+            <div class="m">${fmt.rel(c.t, now)} · ${fmt.localFull(c.t)}</div></div>
           <div class="r">${fmt.km(c.range)}<br><span style="color:var(--text-3)">${fmt.speed(c.speed)}</span></div></div>`).join('')
         : '<div class="empty">No high-interest close approaches above 10° in this sky in the next 48 hours.</div>'}</div>
       ${L.length > 40 ? `<p class="note">${this.plConjAll ? `Showing all ${fmt.int(L.length)}.` : `Showing the first 40 of ${fmt.int(L.length)} (soonest first).`} <button class="btn small" id="plAll">${this.plConjAll ? 'Show fewer' : 'Show all'}</button></p>` : ''}`;

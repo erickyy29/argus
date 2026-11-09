@@ -128,7 +128,9 @@ class App {
     this.prop?.postMessage(msg);
     this.analysis?.postMessage(msg);
     this.nightCache = null;
-    if (this.placeConjKey !== `${o.lat.toFixed(5)},${o.lon.toFixed(5)}`) { this.scene.clearPlaceOverlay(); this.placeConj = null; this.placeConjKey = null; }
+    const placeKey = `${o.lat.toFixed(5)},${o.lon.toFixed(5)}`;
+    if (this.placeBusy && this.placeBusy !== placeKey) { this.placeToken = (this.placeToken || 0) + 1; this.placeBusy = null; }   // drop a scan still running for the old place
+    if (this.placeConjKey !== placeKey) { this.scene.clearPlaceOverlay(); this.placeConj = null; this.placeConjKey = null; }
     if (this.scene.mode === 'orbital' && !this.selection) this.scene.resetView();
     this.bus.emit('observer');
   }
@@ -172,7 +174,9 @@ class App {
   async computePlaceConjunctions() {
     if (!this.catalog.objects.length) return;
     const token = (this.placeToken = (this.placeToken || 0) + 1);
-    const obs = this.observer, key = `${obs.lat.toFixed(5)},${obs.lon.toFixed(5)}`;
+    // a snapshot: Observer.set() changes this.observer in place, and the observer can move while the fetch is pending
+    const o0 = this.observer, obs = new Observer({ lat: o0.lat, lon: o0.lon, alt: o0.alt, name: o0.name });
+    const key = `${obs.lat.toFixed(5)},${obs.lon.toFixed(5)}`;
     this.placeBusy = key;
     if (this.placeConjKey !== key) { this.placeConj = null; this.scene.clearPlaceOverlay(); }
     this.bus.emit('place');
@@ -439,7 +443,7 @@ class App {
         const added = this.catalog.objects.filter((o) => o.catId === 'custom');
         await this.loadCatalog();
         if (added.length) this.addObjects(added.filter((o, k) => !this.catalog.byId.has(o.id) && added.findIndex((x) => x.id === o.id) === k).map((o) => ({ ...o, satrec: undefined })));
-        if (sel && this.catalog.byId.has(sel)) this.select({ kind: 'sat', obj: this.catalog.byId.get(sel) });
+        if (sel && this.catalog.byId.has(sel)) this.select({ kind: 'sat', obj: this.catalog.byId.get(sel) }, { keepPending: true });
       }
     } catch { /* keep current */ }
   }
@@ -508,7 +512,8 @@ class App {
 
   /* ───────────── selection ───────────── */
 
-  select(sel) {
+  select(sel, { keepPending = false } = {}) {
+    if (!keepPending) this.cancelPendingEncounter();
     this.selection = sel;
     this.scene.setSelected(sel?.kind === 'sat' ? sel.obj.i : -1);
     this.orbitStamp = 0;
@@ -549,8 +554,11 @@ class App {
 
   async viewEncounter({ id1, id2, tca, socrates = null }) {
     const tok = (this.encSeq = (this.encSeq || 0) + 1);
+    this.encLoading = tok;
     toast('Loading both objects and refining the encounter with SGP4…');
-    const [a, b] = await Promise.all([this.ensureObject(id1), this.ensureObject(id2)]);
+    let a, b;
+    try { [a, b] = await Promise.all([this.ensureObject(id1), this.ensureObject(id2)]); }
+    finally { if (this.encLoading === tok) this.encLoading = 0; }
     if (tok !== this.encSeq) return;
     if (!a || !b) { toast('One of the objects has no public orbital elements.', 'err'); return; }
     const ra = this.satrec(a), rb = this.satrec(b);
@@ -590,6 +598,11 @@ class App {
     this.scene.setPairOrbit(ob?.pts);
     this.scene.flyTo(() => this.selectedWorld(), 0.22);
     this.bus.emit('encounter', this.encounter);
+  }
+
+  /** Drop a replay whose objects are still loading: the user has moved on (Escape, another selection, Sky view). */
+  cancelPendingEncounter() {
+    if (this.encLoading && this.encLoading === this.encSeq) { this.encSeq += 1; this.encLoading = 0; }
   }
 
   closeEncounter(goLive = true) {
@@ -727,6 +740,7 @@ class App {
     });
     this.bus.on('neo:elements', () => { this.neoDirty = true; });
     this.bus.on('neo:list', () => { this.neoDirty = true; });
+    this.bus.on('view', (mode) => { if (mode === 'sky') this.cancelPendingEncounter(); });
     window.addEventListener('keydown', (e) => {
       if (e.target.closest('input, select, textarea')) return;
       if (e.key === ' ') { e.preventDefault(); this.clock.toggle(); }

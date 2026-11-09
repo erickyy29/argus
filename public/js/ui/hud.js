@@ -179,8 +179,10 @@ export class Hud {
     $('#obKsc').onclick = () => set({ ...DEFAULT_OBSERVER, name: 'Kennedy Space Center' });
     $('#obGeo').onclick = () => {
       if (!navigator.geolocation) return toast('Geolocation is not available in this browser.', 'err');
-      navigator.geolocation.getCurrentPosition((p) => set({ lat: p.coords.latitude, lon: p.coords.longitude, alt: (p.coords.altitude || 0) / 1000, name: 'My location' }),
-        (e) => toast(`Location unavailable: ${e.message}`, 'err'), { timeout: 10000 });
+      const seq = this.app.obsSeq || 0;   // a place chosen while the browser is still locating wins
+      navigator.geolocation.getCurrentPosition(
+        (p) => { if ((this.app.obsSeq || 0) === seq) set({ lat: p.coords.latitude, lon: p.coords.longitude, alt: (p.coords.altitude || 0) / 1000, name: 'My location' }); },
+        (e) => { if ((this.app.obsSeq || 0) === seq) toast(`Location unavailable: ${e.message}`, 'err'); }, { timeout: 10000 });
     };
   }
 

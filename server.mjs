@@ -34,8 +34,18 @@ const MIN = 60_000, HOUR = 60 * MIN, DAY = 24 * HOUR;
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 const nasa = { key: (process.env.NASA_API_KEY || '').trim() || 'DEMO_KEY' };
-// Place search: the public OSM Nominatim by default; point NOMINATIM_URL at your own instance for heavy traffic.
-const NOMINATIM_URL = (process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org').trim().replace(/\/+$/, '');
+// Place search: the public OSM Nominatim by default. For heavy traffic set NOMINATIM_URL to your own Nominatim instance or a
+// hosted Nominatim-compatible service, and NOMINATIM_PARAMS to any extra query parameters it needs (e.g. "key=…").
+const OSM_NOMINATIM = 'https://nominatim.openstreetmap.org';
+const NOMINATIM_URL = (() => {
+  const v = (process.env.NOMINATIM_URL || '').trim().replace(/\/+$/, '');
+  if (!v) return OSM_NOMINATIM;
+  try { if (/^https?:$/.test(new URL(v).protocol)) return v; } catch { /* fall through */ }
+  console.warn(`NOMINATIM_URL is not an http(s) URL; using ${OSM_NOMINATIM}`);
+  return OSM_NOMINATIM;
+})();
+const NOMINATIM_PUBLIC = NOMINATIM_URL === OSM_NOMINATIM;
+const NOMINATIM_PARAMS = new URLSearchParams((process.env.NOMINATIM_PARAMS || '').trim().replace(/^\?/, ''));
 nasa.status = nasa.key === 'DEMO_KEY' ? 'demo' : 'unverified';
 
 function loadDotEnv(file) {
@@ -51,7 +61,7 @@ function loadDotEnv(file) {
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 process.on('unhandledRejection', (e) => log('unhandled rejection:', e?.stack || e));
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
-const redact = (u) => u.replace(/api_key=[^&]+/i, 'api_key=***');
+const redact = (u) => u.replace(/([?&](?:api_key|apikey|key|token|access_token|secret)=)[^&]+/gi, '$1***');
 const snippet = (buf) => buf.subarray(0, 240).toString('utf8').replace(/\s+/g, ' ').trim();
 const isoDate = (ms) => new Date(ms).toISOString().slice(0, 10);
 const num = (s) => (s === undefined || s === null || s === '' ? null : Number(s));
@@ -81,6 +91,7 @@ const LIMITERS = {
   'api.wheretheiss.at': new Limiter(1, 1100),     // ~1 request/second limit
 };
 const DEFAULT_LIMITER = new Limiter(6);
+LIMITERS[new URL(NOMINATIM_URL).hostname] ??= new Limiter(1, 1100);   // custom NOMINATIM_URL: same 1 request/s pacing
 const hostCooldown = new Map();   // host → { until, message }  (set when a host with opt.cooldown answers 429/403)
 function retryAfterMs(v) {
   if (!v) return null;
@@ -89,13 +100,18 @@ function retryAfterMs(v) {
   const t = Date.parse(v);
   return Number.isFinite(t) ? Math.max(0, t - Date.now()) : null;
 }
+const transient = (status, message) => Object.assign(new HttpError(status, message), { transient: true });
+/** The 503 to answer while `host` is paused after a 429/403, or null. */
+function cooldownError(host) {
+  const cd = hostCooldown.get(host);
+  if (!cd) return null;
+  if (Date.now() >= cd.until) { hostCooldown.delete(host); return null; }
+  return transient(503, `${cd.message} Try again in about ${Math.max(1, Math.ceil((cd.until - Date.now()) / MIN))} min.`);
+}
 /** Fail fast (without marking the key as failed) while a host is cooling down or its queue is full. */
 function hostBusy(host, limiter, opt) {
-  const cd = hostCooldown.get(host);
-  if (cd && Date.now() < cd.until) return new HttpError(503, `${cd.message} Try again in about ${Math.max(1, Math.ceil((cd.until - Date.now()) / 60_000))} min.`);
-  if (cd) hostCooldown.delete(host);
-  if (opt.maxQueue != null && limiter.queue.length + limiter.active >= opt.maxQueue) return new HttpError(503, opt.busyMessage || `${host} is busy; try again shortly.`);
-  return null;
+  return cooldownError(host)
+    || (opt.maxQueue != null && limiter.queue.length + limiter.active >= opt.maxQueue ? transient(503, opt.busyMessage || `${host} is busy; try again shortly.`) : null);
 }
 
 /* ──────────────────────────────── cache layer ──────────────────────────────── */
@@ -183,6 +199,8 @@ async function refresh(key, url, prev, opt) {
   const t0 = Date.now();
   try {
     const result = await limiter.run(async () => {
+      const paused = cooldownError(host);   // a 429/403 may have arrived while this request waited in the queue
+      if (paused) throw paused;
       const headers = { 'user-agent': UA, accept: opt.accept || '*/*', ...(opt.headers || {}) };
       if (prev?.lastModified) headers['if-modified-since'] = prev.lastModified;
       if (prev?.etag) headers['if-none-match'] = prev.etag;
@@ -199,9 +217,9 @@ async function refresh(key, url, prev, opt) {
     const { res, body } = result;
     if (!res.ok) {
       if (opt.cooldown && (res.status === 429 || res.status === 403)) {
-        const wait = retryAfterMs(res.headers.get('retry-after')) ?? (res.status === 429 ? 2 * MIN : 30 * MIN);
-        hostCooldown.set(host, { until: Date.now() + Math.min(wait, 6 * HOUR), message: opt.cooldown });
-        const err = new HttpError(503, `${opt.cooldown} Try again in about ${Math.max(1, Math.ceil(wait / MIN))} min.`);
+        const asked = retryAfterMs(res.headers.get('retry-after')) ?? (res.status === 429 ? 2 * MIN : 30 * MIN);
+        hostCooldown.set(host, { until: Date.now() + Math.min(Math.max(asked, 5000), 6 * HOUR), message: opt.cooldown });
+        const err = cooldownError(host) || transient(503, opt.cooldown);
         err.detail = `${host} responded ${res.status}: ${snippet(body)}`;
         throw err;
       }
@@ -223,7 +241,7 @@ async function refresh(key, url, prev, opt) {
     return { entry, cache: 'MISS' };
   } catch (err) {
     const message = err.name === 'TimeoutError' ? `${host} timed out` : err.message;
-    failures.set(key, { at: Date.now(), message });
+    if (!err.transient) failures.set(key, { at: Date.now(), message });   // a host-wide pause is not this key's failure
     noteFeed(opt.feed, false, message);
     log(`✗ ${host} ${key} — ${message}${err.detail ? ` — ${err.detail}` : ''}${prev ? ' (serving last good copy)' : ''}`);
     if (prev) return { entry: prev, cache: 'STALE' };
@@ -845,16 +863,18 @@ route(/^\/api\/socrates\/upcoming$/, async (req, res, m, q) => {
 /**
  * Place search via OpenStreetMap Nominatim. Usage policy: ≤ 1 request/s (limiter above), an identifying User-Agent,
  * results cached (30 days here, 7 days at the CDN), and no search-as-you-type — the client only searches on submit.
- * At most 12 lookups wait in the queue; a 429/403 pauses lookups for Retry-After (or 2 / 30 min).
+ * At most 12 lookups wait in the queue; a 429/403 pauses lookups for Retry-After (or 2 / 30 min, at least 5 s, at most 6 h).
  */
+const GEO_SERVICE = NOMINATIM_PUBLIC ? 'OpenStreetMap' : 'the geocoding service';
 route(/^\/api\/geocode$/, async (req, res, m, q) => {
   const s = (q.get('q') || '').trim().replace(/\s+/g, ' ').slice(0, 120);
   if (s.length < 2) throw new HttpError(400, 'query too short');
   const params = new URLSearchParams({ q: s, format: 'jsonv2', limit: '6', 'accept-language': 'en' });
+  for (const [k, v] of NOMINATIM_PARAMS) if (k !== 'q' && k !== 'format') params.set(k, v);
   const r = await getCached(`geocode:${s.toLowerCase()}`, `${NOMINATIM_URL}/search?${params}`, {
     ttl: 30 * DAY, retryAfter: MIN, validate: validJsonArray, type: JSON_TYPE, feed: 'osm-nominatim', timeout: 20_000,
-    maxQueue: 12, busyMessage: 'Place search is busy (OpenStreetMap allows one lookup per second). Try again in a few seconds, or type coordinates such as 43.776, -79.258.',
-    cooldown: 'Place search is paused because OpenStreetMap asked us to slow down. You can still type coordinates such as 43.776, -79.258.',
+    maxQueue: 12, busyMessage: `Place search is busy (${GEO_SERVICE} allows one lookup per second). Try again in a few seconds, or type coordinates such as 43.776, -79.258.`,
+    cooldown: `Place search is paused because ${GEO_SERVICE} asked us to slow down. You can still type coordinates such as 43.776, -79.258.`,
   });
   const results = JSON.parse(r.entry.body.toString('utf8')).map((p) => ({
     name: p.name || String(p.display_name || '').split(',')[0], label: p.display_name, lat: Number(p.lat), lon: Number(p.lon),
