@@ -11,6 +11,7 @@
  * Zero dependencies (Node.js 20+):   node server.mjs   →   http://localhost:8080
  */
 import http from 'node:http';
+import os from 'node:os';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -21,7 +22,9 @@ import { lifetimeYears, lifetimeAltitude, BALLISTIC } from './public/js/lib/life
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const CACHE_DIR = path.join(ROOT, '.cache');
+const ON_VERCEL = !!process.env.VERCEL;   // deployed as a Vercel Function (see api/index.mjs, vercel.json)
+// Vercel's filesystem is read-only except /tmp; locally the cache lives next to the code.
+const CACHE_DIR = process.env.ARGUS_CACHE_DIR || (ON_VERCEL ? path.join(os.tmpdir(), 'argus-cache') : path.join(ROOT, '.cache'));
 loadDotEnv(path.join(ROOT, '.env'));
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -78,7 +81,8 @@ const DEFAULT_LIMITER = new Limiter(6);
 
 /* ──────────────────────────────── cache layer ──────────────────────────────── */
 
-fs.mkdirSync(CACHE_DIR, { recursive: true });
+let DISK_CACHE = true;
+try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch (e) { DISK_CACHE = false; log(`disk cache disabled (${e.code || e.message}); using memory only`); }
 const memCache = new Map();   // key → entry { key, url, type, fetchedAt, lastModified, etag, body, gz? } (LRU order)
 const MEM_LIMIT = 256 * 1024 * 1024;
 let memBytes = 0;
@@ -91,6 +95,7 @@ function memPut(key, entry) {
 }
 function memGet(key) { const e = memCache.get(key); if (e) { memCache.delete(key); memCache.set(key, e); } return e; }
 (async () => {   // prune disk entries untouched for 60 days
+  if (!DISK_CACHE) return;
   try {
     for (const f of await fsp.readdir(CACHE_DIR)) {
       if (!f.endsWith('.json')) continue;
@@ -107,6 +112,7 @@ const feedState = new Map();  // feed → { ok, at, message }
 const cachePath = (key) => path.join(CACHE_DIR, crypto.createHash('sha1').update(key).digest('hex'));
 
 async function readDisk(key) {
+  if (!DISK_CACHE) return null;
   try {
     const base = cachePath(key);
     const meta = JSON.parse(await fsp.readFile(base + '.json', 'utf8'));
@@ -114,10 +120,13 @@ async function readDisk(key) {
   } catch { return null; }
 }
 async function writeDisk(entry) {
+  if (!DISK_CACHE) return;
   const base = cachePath(entry.key);
   const { body, gz, ...meta } = entry;
-  await fsp.writeFile(base + '.bin', body);
-  await fsp.writeFile(base + '.json', JSON.stringify(meta));
+  try {
+    await fsp.writeFile(base + '.bin', body);
+    await fsp.writeFile(base + '.json', JSON.stringify(meta));
+  } catch (e) { log(`cache write failed (${e.code || e.message})`); }
 }
 function noteFeed(feed, ok, message = '') { if (feed) feedState.set(feed, { ok, at: Date.now(), message }); }
 
@@ -202,9 +211,27 @@ function validImage(buf, res) {
 /* ──────────────────────────────── responses ──────────────────────────────── */
 
 const COMPRESSIBLE = /json|text|javascript|csv|xml|svg/;
+
+/**
+ * On Vercel each function instance starts cold with an empty cache, so successful responses are cached by
+ * Vercel's CDN (s-maxage). That keeps upstream services (CelesTrak in particular) from being re-downloaded
+ * per instance. Locally the disk cache does this job and responses stay no-store.
+ */
+const CDN_POLICY = [
+  [/^\/vendor\//, 31536000, 86400], [/^\/api\/gibs\//, 86400, 3600], [/^\/api\/(sbdb|images|epic-image)/, 86400, 3600],
+  [/^\/api\/(environment|satcat)/, 3600, 300], [/^\/api\/(catalog|socrates|neo|cad|horizons|tle|gp|gp-catnr|epic|sentry)/, 1800, 120],
+  [/^\/api\/eonet/, 600, 120], [/^\/api\/swpc\//, 60, 30], [/^\/api\/iss$/, 4, 0],
+];
+function cdnCacheControl(pathname) {
+  for (const [re, sMax, browser] of CDN_POLICY) {
+    if (re.test(pathname)) return `public, max-age=${browser}, s-maxage=${sMax}, stale-while-revalidate=${Math.max(30, sMax * 4)}`;
+  }
+  return null;
+}
 function send(req, res, status, body, type, extra = {}) {
   let buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
   const headers = { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...extra };
+  if (res.argusCache && status < 400) headers['cache-control'] = res.argusCache;
   if (buf.length > 1400 && COMPRESSIBLE.test(type) && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
     buf = zlib.gzipSync(buf, { level: 6 }); headers['content-encoding'] = 'gzip'; headers.vary = 'accept-encoding';
   }
@@ -219,6 +246,7 @@ function sendEntry(req, res, { entry, cache }, extra = {}) {
     'content-type': entry.type, 'x-cache': cache, 'x-fetched-at': new Date(entry.fetchedAt).toISOString(),
     'x-source': new URL(entry.url).hostname, 'cache-control': 'no-store', ...extra,
   };
+  if (res.argusCache) headers['cache-control'] = res.argusCache;
   const gzipOk = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
   if (gzipOk && entry.body.length > 1400 && COMPRESSIBLE.test(entry.type)) {
     entry.gz ??= zlib.gzipSync(entry.body, { level: 6 });
@@ -667,7 +695,7 @@ route(/^\/api\/catalog$/, async (req, res) => {
   const c = await buildCatalog();
   const gzipOk = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
   const body = gzipOk ? c.gz : c.json;
-  res.writeHead(200, { 'content-type': JSON_TYPE, 'cache-control': 'no-store', 'content-length': body.length, ...(gzipOk ? { 'content-encoding': 'gzip', vary: 'accept-encoding' } : {}) });
+  res.writeHead(200, { 'content-type': JSON_TYPE, 'cache-control': res.argusCache || 'no-store', 'content-length': body.length, ...(gzipOk ? { 'content-encoding': 'gzip', vary: 'accept-encoding' } : {}) });
   res.end(req.method === 'HEAD' ? undefined : body);
 });
 
@@ -980,11 +1008,19 @@ async function serveStatic(req, res, pathname) {
 const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', ...(process.env.ALLOWED_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean)]);
 const hostAllowed = (h) => { const name = (h || '').replace(/:\d+$/, ''); return ALLOWED_HOSTS.has(name) || /^\d{1,3}(\.\d{1,3}){3}$/.test(name); };
 
-const server = http.createServer(async (req, res) => {
+/** The request handler: used by the local HTTP server below and exported as the Vercel Function (api/index.mjs). */
+export async function handler(req, res) {
   let url;
   try { url = new URL(req.url, 'http://localhost'); } catch { return sendJson(req, res, 400, { error: 'bad request' }); }
-  // Block DNS-rebinding: only answer to localhost, IP literals or explicitly allowed host names.
-  if (!hostAllowed(req.headers.host)) return sendJson(req, res, 421, { error: 'misdirected request' });
+  // vercel.json rewrites /api/* and /vendor/* to this function and passes the original route in __route.
+  if ((url.pathname === '/api/index' || url.pathname === '/api') && url.searchParams.has('__route')) {
+    const route = url.searchParams.get('__route');
+    url.searchParams.delete('__route');
+    try { url = new URL(`/${route.replace(/^\/+/, '')}${url.search}`, 'http://localhost'); } catch { return sendJson(req, res, 400, { error: 'bad request' }); }
+  } else url.searchParams.delete('__route');
+  // Block DNS-rebinding locally: only answer to localhost, IP literals or explicitly allowed host names.
+  if (!ON_VERCEL && !hostAllowed(req.headers.host)) return sendJson(req, res, 421, { error: 'misdirected request' });
+  res.argusCache = ON_VERCEL && (req.method === 'GET' || req.method === 'HEAD') ? cdnCacheControl(url.pathname) : null;
   try {
     if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method not allowed');
     for (const [re, fn] of ROUTES) {
@@ -999,8 +1035,14 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) sendJson(req, res, status, { error: err.message });
     else res.end();
   }
-});
+}
+export default handler;
 
+const server = http.createServer(handler);
+
+if (!ON_VERCEL) startLocalServer();
+
+function startLocalServer() {
 server.on('error', (e) => {
   if (e.code === 'EADDRINUSE') console.error(`Port ${PORT} is busy. Start with another port:  PORT=8090 node server.mjs`);
   else console.error(e);
@@ -1018,3 +1060,4 @@ server.listen(PORT, HOST, () => {
     await ensureSocrates().catch((e) => log('SOCRATES warm-up failed:', e.message));
   })();
 });
+}

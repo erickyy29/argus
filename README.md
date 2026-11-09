@@ -29,6 +29,18 @@ NASA_API_KEY=DEMO_KEY
 
 The key supplied for this project was rejected by api.nasa.gov (`API_KEY_INVALID`), so the app runs on NASA's public `DEMO_KEY`. That allows only a handful of requests per hour, which is enough because the server fetches the feed once every 6 hours. To use your own key, request one at https://api.nasa.gov, paste it into `.env`, and restart. If a key is ever rejected, the server falls back to `DEMO_KEY` automatically. JPL, CelesTrak, EONET, GIBS, EPIC and NOAA need no key.
 
+### Deploy to Vercel
+
+The repo deploys as-is: `vercel.json` serves `public/` from Vercel's CDN and routes `/api/*` and `/vendor/*` to one Vercel Function (`api/index.mjs`), which reuses the same handler as `server.mjs`.
+
+1. In Vercel, **Add New → Project** and import this repository. The framework preset (Other), output directory (`public`) and function settings come from `vercel.json`, so leave the build settings empty.
+2. Under **Settings → Environment Variables**, add `NASA_API_KEY` with your own key. `DEMO_KEY` limits are counted per IP address, and Vercel's IPs are shared, so the asteroid feed will often be rate-limited without one.
+3. Deploy. The first request after a cold start can take 20–40 s while the catalogues are downloaded. After that, Vercel's CDN serves cached responses (for example, 30 min for orbital elements and conjunctions), so upstream services aren't re-downloaded per visitor.
+
+Notes for the deployed site:
+- It is served over HTTPS, so browsers block the mount's **Wi-Fi** link (`ws://`, mixed content). Use **USB (Web Serial)** there, or run the local server for Wi-Fi control.
+- Functions run for up to 300 s (`maxDuration` in `vercel.json`), which is the Hobby limit with Fluid compute. If your plan has a lower limit, lower it there.
+
 ---
 
 ## What it does
