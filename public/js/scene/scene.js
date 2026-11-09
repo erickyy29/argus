@@ -9,7 +9,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/OrbitControls';
 import { CATEGORIES, hexToRgb, EONET_COLORS, NEO_COLOR, PHA_COLOR } from '../lib/config.js';
-import { DEG, eqjToEqd } from '../lib/astro.js';
+import { DEG, eqjToEqd, geodeticToEcef } from '../lib/astro.js';
 import { clamp } from '../lib/util.js';
 
 const ecefToLocal = (v) => new THREE.Vector3(v[0], v[2], -v[1]);   // ECEF (any unit) → Earth-group local
@@ -24,6 +24,7 @@ export function extrapolate(px, py, pz, vx, vy, vz, dt, out) {
   return out.set((px * c + (ny * pz - nz * py) * s) * k, (py * c + (nz * px - nx * pz) * s) * k, (pz * c + (nx * py - ny * px) * s) * k);
 }
 const STAR_R = 9000, SUN_R = 8000;
+const IDQ = new THREE.Quaternion();
 
 const POINT_VS = /* glsl */`
   attribute vec3 velocity; attribute vec3 color; attribute float size; attribute float cat; attribute float state; attribute float risk;
@@ -502,6 +503,82 @@ export class SceneView {
     this.fovRing.position.copy(d).multiplyScalar(L);
   }
 
+  /* ───────────────────────── place overlay ───────────────────────── */
+
+  /** Fly to the observer's location (looking down, slightly tilted) and keep it in view as the Earth turns. */
+  flyToSurface(dist = 0.95) {
+    if (!this.obsLocal) return;
+    if (this.mode === 'sky') this.setMode('orbital');
+    const getPos = () => this.obsLocal.clone().applyMatrix4(this.earth.matrixWorld);
+    // looking down, tilted 20° toward the equator — stored Earth-fixed so it turns with the place
+    const dirLocal = this.enuLocal.U.clone().multiplyScalar(0.94).addScaledVector(this.enuLocal.N, -0.34).normalize();
+    const fromDir = this.camera.position.clone().sub(this.controls.target).normalize();
+    this.flight = { t0: performance.now(), dur: 1600, fromT: this.controls.target.clone(), fromD: this.camera.position.distanceTo(this.controls.target),
+      fromDir, dirLocal, getPos, dist };
+    this.follow = getPos;
+    this.followEarth = true;
+  }
+
+  /**
+   * Ring = area from which an object at 550 km is above 10°; markers = where (Earth-fixed, at altitude) each
+   * close approach visible from the place will happen.
+   */
+  setPlaceOverlay({ lat, lon, ringDeg, conj = [] }) {
+    this.clearPlaceOverlay();
+    const g = (this.placeGroup = new THREE.Group());
+    const la = lat * DEG, lo = lon * DEG;
+    const c = ecefToLocal([Math.cos(la) * Math.cos(lo), Math.cos(la) * Math.sin(lo), Math.sin(la)]);
+    const u = new THREE.Vector3(0, 1, 0).cross(c);
+    if (u.lengthSq() < 1e-8) u.set(1, 0, 0);
+    u.normalize();
+    const v = c.clone().cross(u).normalize();
+    const r = ringDeg * DEG, ring = [];
+    for (let k = 0; k <= 180; k++) {
+      const a = (k / 180) * Math.PI * 2;
+      ring.push(c.clone().multiplyScalar(Math.cos(r)).addScaledVector(u, Math.sin(r) * Math.cos(a)).addScaledVector(v, Math.sin(r) * Math.sin(a)).multiplyScalar(1 + 550 / 6378.137));
+    }
+    const ringLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(ring), new THREE.LineBasicMaterial({ color: 0x4ea8ff, transparent: true, opacity: 0.75 }));
+    g.add(ringLine);
+    const n = Math.max(1, conj.length);
+    const pos = new Float32Array(n * 3), col = new Float32Array(n * 3), size = new Float32Array(n);
+    conj.forEach((cj, i) => {
+      pos.set(ecefToLocal(geodeticToEcef(cj.lat, cj.lon, cj.altKm)).multiplyScalar(1 / 6378.137).toArray(), i * 3);
+      col.set(hexToRgb(cj.prob >= 1e-4 ? '#ff3d4d' : cj.prob >= 1e-5 ? '#f5b942' : '#b8c2d6'), i * 3);
+      size[i] = cj.prob >= 1e-4 ? 13 : 11;
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.setAttribute('size', new THREE.BufferAttribute(size, 1));
+    if (conj.length) {
+      const drops = [];
+      conj.forEach((cj, i) => {
+        drops.push(new THREE.Vector3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]));
+        drops.push(ecefToLocal(geodeticToEcef(cj.lat, cj.lon, 0)).multiplyScalar(1.002 / 6378.137));
+      });
+      g.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(drops), new THREE.LineBasicMaterial({ color: 0xff6b7a, transparent: true, opacity: 0.22, depthWrite: false })));
+    }
+    const pts = new THREE.Points(geo, new THREE.ShaderMaterial({ uniforms: { uPx: { value: this.px } }, vertexShader: SPRITE_VS,
+      fragmentShader: /* glsl */`varying vec3 vColor; void main(){ vec2 c=gl_PointCoord-0.5; float rr=length(c); if(rr>0.5) discard;
+        float x=min(abs(c.x+c.y),abs(c.x-c.y))*0.7071; float a=max(smoothstep(0.09,0.03,x)*step(rr,0.36), smoothstep(0.5,0.45,rr)*smoothstep(0.38,0.43,rr));
+        if(a<0.05) discard; gl_FragColor=vec4(vColor,a);} `,
+      transparent: true, depthWrite: false }));
+    pts.visible = conj.length > 0;
+    pts.frustumCulled = false;
+    g.add(pts);
+    g.visible = this.placeOverlayVisible ?? true;
+    this.placeConjPts = pts;
+    this.placeConj = conj;
+    this.earth.add(g);
+  }
+  clearPlaceOverlay() {
+    if (!this.placeGroup) return;
+    this.earth.remove(this.placeGroup);
+    this.placeGroup.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); });
+    this.placeGroup = null; this.placeConjPts = null; this.placeConj = [];
+  }
+  setPlaceOverlayVisible(on) { this.placeOverlayVisible = on; if (this.placeGroup) this.placeGroup.visible = on; }
+
   /* ───────────────────────── labels ───────────────────────── */
 
   setLabel(key, text, getPos, cls = '', color = null) {
@@ -556,9 +633,11 @@ export class SceneView {
     const dir = this.camera.position.clone().sub(c.target).normalize();
     this.flight = { t0: performance.now(), dur: 1100, fromT: c.target.clone(), fromD: this.camera.position.distanceTo(c.target), dir, getPos, dist };
     this.follow = follow ? getPos : null;
+    this.followEarth = false;
   }
   resetView() {
     this.follow = null;
+    this.followEarth = false;
     if (this.mode === 'sky') { this.sky = { az: 180, el: 30, fov: 70 }; return; }
     const target = this.obsLocal ? this.obsLocal.clone().applyMatrix4(this.earth.matrixWorld).normalize().multiplyScalar(3.4) : new THREE.Vector3(0, 1.5, 3.6);
     this.flight = { t0: performance.now(), dur: 1100, fromT: this.controls.target.clone(), fromD: this.camera.position.length(), dir: target.clone().normalize(), getPos: () => new THREE.Vector3(), dist: 3.4 };
@@ -579,7 +658,7 @@ export class SceneView {
       ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'a30', 'a60'].forEach((k) => this.removeLabel(`compass:${k}`));
     } else {
       this.savedOrbital = { pos: this.camera.position.clone(), target: this.controls.target.clone() };
-      this.follow = null; this.flight = null;
+      this.follow = null; this.flight = null; this.followEarth = false;
       const pts = { N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315 };
       for (const [k, az] of Object.entries(pts)) this.setLabel(`compass:${k}`, k, () => this.skyWorld(az, 1.5, 0.45), `compass ${k === 'N' ? 'n' : ''}`);
       this.setLabel('compass:a30', '30°', () => this.skyWorld(this.sky.az, 30, 0.45), 'alt');
@@ -669,6 +748,10 @@ export class SceneView {
       const a = this.eventPts.geometry.attributes.position.array, mw = this.earth.matrixWorld;
       this.events.forEach((e, i) => { this._v.set(a[i * 3], a[i * 3 + 1], a[i * 3 + 2]).applyMatrix4(mw); const p = this._v.clone(); tryPoint(p.x, p.y, p.z, { kind: 'event', i }); });
     }
+    if (this.placeConjPts?.visible && this.placeGroup?.visible) {
+      const a = this.placeConjPts.geometry.attributes.position.array, mw = this.earth.matrixWorld;
+      (this.placeConj || []).forEach((cj, i) => { const p = new THREE.Vector3(a[i * 3], a[i * 3 + 1], a[i * 3 + 2]).applyMatrix4(mw); tryPoint(p.x, p.y, p.z, { kind: 'conj', i }, 45); });
+    }
     return best.hit;
   }
 
@@ -718,15 +801,31 @@ export class SceneView {
         const k = clamp((performance.now() - f.t0) / f.dur, 0, 1), e = k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2;
         const goal = f.getPos();
         if (goal) {
-          const tgt = f.fromT.clone().lerp(goal, e);
+          const r0 = f.fromT.length(), r1 = goal.length();
+          let tgt;
+          if (r0 > 1e-6 && r1 > 1e-6) {
+            const qT = new THREE.Quaternion().setFromUnitVectors(f.fromT.clone().normalize(), goal.clone().normalize());
+            tgt = f.fromT.clone().normalize().applyQuaternion(new THREE.Quaternion().slerpQuaternions(IDQ, qT, e)).multiplyScalar(r0 + (r1 - r0) * e);
+          } else tgt = f.fromT.clone().lerp(goal, e);
           const d = f.fromD + (f.dist - f.fromD) * e;
+          let dir = f.dir;
+          if (f.dirLocal) {
+            const to = f.dirLocal.clone().transformDirection(this.earth.matrixWorld);
+            dir = f.fromDir.clone().applyQuaternion(new THREE.Quaternion().slerpQuaternions(IDQ, new THREE.Quaternion().setFromUnitVectors(f.fromDir, to), e));
+          }
           c.target.copy(tgt);
-          this.camera.position.copy(tgt).addScaledVector(f.dir, d);
+          this.camera.position.copy(tgt).addScaledVector(dir, d);
+          if (this.camera.position.length() < 1.05) this.camera.position.setLength(1.05);
         }
         if (k >= 1) this.flight = null;
       } else if (this.follow) {
         const goal = this.follow();
-        if (goal) { const delta = goal.clone().sub(c.target); c.target.add(delta); this.camera.position.add(delta); }
+        if (goal) {
+          if (this.followEarth && this._lastGmst != null) {
+            const off = this.camera.position.clone().sub(c.target).applyAxisAngle(new THREE.Vector3(0, 1, 0), gmst - this._lastGmst);
+            c.target.copy(goal); this.camera.position.copy(goal).add(off);
+          } else { const delta = goal.clone().sub(c.target); c.target.add(delta); this.camera.position.add(delta); }
+        }
       }
       c.minDistance = c.target.lengthSq() > 1e-6 ? 0.02 : 1.04;
       c.update();
@@ -744,6 +843,7 @@ export class SceneView {
       this.camera.near = 1e-5;
     }
     this.camera.updateProjectionMatrix();
+    this._lastGmst = gmst;
     this.updateLabels();
     this.renderer.render(this.scene, this.camera);
   }

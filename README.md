@@ -45,6 +45,13 @@ Notes for the deployed site:
 
 ## What it does
 
+### 0 · Location: what is above a place
+- Type a place, an address or `lat, lon` into **Go to a place…** (top bar or the **Location** tab), for example *Scarborough Town Centre*. The globe flies there, and the place becomes the observer and mount location.
+- **Overhead right now:** how many objects are above the horizon, how many are sunlit, how many are in high-risk encounters, and which are highest.
+- **Close approaches in this sky:** upcoming SOCRATES encounters (worst-case Max Pc ≥ 10⁻⁴ or miss < 1 km, between different operators or an active satellite and a dead object) whose time-of-closest-approach position is at least 10° above the place's horizon. They are recomputed with SGP4 from the latest elements, marked ✕ on the globe, flagged *observable* when sunlit against a dark sky, and replayable in 3D.
+- A ring shows the area from which objects at 550 km appear more than 10° up. Natural events within 1,000 km are listed too.
+- Place search uses OpenStreetMap Nominatim (© OpenStreetMap contributors). Following its usage policy, the app searches only when you press Enter, and the server identifies itself, sends at most 1 request per second and caches results for 30 days. That limit and cache are per server process: on Vercel each function instance has its own, and the CDN shares identical searches for 7 days. If OpenStreetMap answers 429 or 403, lookups pause (for its Retry-After, or 2 / 30 min) and coordinates still work. The public Nominatim service is meant for light use; for heavy public traffic, set `NOMINATIM_URL` to your own Nominatim instance or a commercial Nominatim-compatible geocoder. Search text goes to OpenStreetMap, so don't type anything you'd rather keep private.
+
 ### 1 · Collision risk (opens first)
 - **7-day conjunction report for the whole public catalogue** from CelesTrak SOCRATES: every predicted approach closer than 5 km, ranked by covariance-free *Max Pc* or miss distance.
 - **Who can act on it**: each encounter is classed as *same operator* (handled internally), *cross-operator* (two operators must coordinate), or *active ↔ derelict* (only one side can manoeuvre). Includes a breakdown by altitude shell and the most exposed objects.
@@ -96,6 +103,7 @@ Notes for the deployed site:
 | NASA EPIC (DSCOVR) | latest full-disk Earth image | 1 h | – |
 | NOAA SWPC | Kp, scales, real-time solar wind, GOES X-rays, alerts | 1–10 min | – |
 | wheretheiss.at | independent live ISS position (SGP4 cross-check) | 4 s | – |
+| OpenStreetMap Nominatim | place search (geocoding), on demand | 30 d (CDN 7 d) | – |
 | HYG via d3-celestial · NASA SVS CGI Moon Kit | star field, Moon texture | static | – |
 
 The server only proxies this allow-list. It never refetches a source faster than its cache time, and it serves the last good copy (marked *stale*) if a source is down. The **Feeds** button in the top bar shows every feed's status and age.

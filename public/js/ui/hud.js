@@ -3,6 +3,7 @@ import { $, $$, esc, fmt, feeds, toast } from '../lib/util.js';
 import { CATEGORIES, NEO_COLOR, PHA_COLOR, DEFAULT_OBSERVER } from '../lib/config.js';
 import { RE } from '../lib/astro.js';
 import { mountDial } from './charts.js';
+import { attachPlaceSearch } from './placesearch.js';
 
 const FLAG_TEXT = { below: 'Target below the horizon — holding at the horizon on its azimuth', sun: 'Sun exclusion — refusing to point near the Sun', limit: 'Elevation limit reached' };
 
@@ -23,6 +24,7 @@ export class Hud {
     $('#observerBtn').addEventListener('click', (e) => this.observerPopover(e.currentTarget));
     $('#feedsBtn').addEventListener('click', (e) => this.feedsPopover(e.currentTarget));
     $('#mountHud').addEventListener('click', () => app.drawer.open('mount'));
+    attachPlaceSearch({ form: $('#placeForm'), input: $('#placeInput'), results: $('#placeResults'), app });
     document.addEventListener('pointerdown', (e) => { const p = $('#popover'); if (!p.classList.contains('hidden') && !p.contains(e.target) && !e.target.closest('#observerBtn, #feedsBtn')) p.classList.add('hidden'); });
     feeds.onChange(() => { this.renderFeedsDot(); if (this.pop === 'feeds') this.renderFeeds(); });
     app.bus.on('observer', () => this.renderObserver());
@@ -133,6 +135,12 @@ export class Hud {
       meta = [o.pha ? 'PHA' : 'NEO', o.now ? fmt.ld(o.now.dKm) : '', o.diameterM ? `~${fmt.int(o.diameterM)} m` : ''].filter(Boolean).join(' · ');
     } else if (hit.kind === 'moon') { title = 'Moon'; meta = 'Click for phase, distance and pointing'; }
     else if (hit.kind === 'event') { const e = app.events[hit.i]; title = e.title; meta = `${e.catTitle} · ${fmt.age(e.date)}`; }
+    else if (hit.kind === 'conj') {
+      const c = app.placeConj?.list?.[hit.i];
+      if (!c) { tip.classList.add('hidden'); return; }
+      title = `${c.n1} ↔ ${c.n2}`;
+      meta = `${fmt.rel(c.t, app.clock.now())} · miss ${fmt.km(c.range)} · Max Pc ${fmt.pc(c.prob)} · ${fmt.deg(c.el, 0)} up · click to replay`;
+    }
     tip.innerHTML = `<div class="tt">${esc(title)}</div><div class="tm">${esc(meta)}</div>`;
     tip.style.left = `${x}px`; tip.style.top = `${y}px`;
     tip.classList.remove('hidden');

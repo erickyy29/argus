@@ -181,6 +181,12 @@ export const diameterFromH = (H, albedo = 0.14) => (1329 / Math.sqrt(albedo)) * 
 export const COMPRESS_R0 = 70;
 export const compressR = (r) => (r <= COMPRESS_R0 ? r : COMPRESS_R0 * (1 + Math.log(r / COMPRESS_R0)));
 
+/** Ground radius (deg of arc) of the area from which an object at hKm appears above minEl degrees. */
+export function visibilityRadiusDeg(hKm, minEl = 10) {
+  const e = minEl * DEG;
+  return (Math.acos((RE / (RE + hKm)) * Math.cos(e)) - e) / DEG;
+}
+
 /** Classical orbital elements from mean motion (rev/day) & eccentricity. */
 export function orbitFromMeanMotion(nRevDay, e) {
   const n = (nRevDay * 2 * Math.PI) / 86400;

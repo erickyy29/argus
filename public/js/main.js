@@ -11,7 +11,7 @@ import { NeoManager } from './data/neo.js';
 import { Mount } from './robot/mount.js';
 import { CATEGORIES, CAT_INDEX, STD_MAG, STD_BY_NAME, NOTABLE, DEFAULT_OBSERVER, FALLBACK_IDS, MOON_COLOR } from './lib/config.js';
 import { Vector3 } from 'three';
-import { Observer, RE, DEG, toScene, sunEci, moonEci, bodyHorizon, nightWindow } from './lib/astro.js';
+import { Observer, RE, DEG, toScene, sunEci, moonEci, bodyHorizon, nightWindow, visibilityRadiusDeg } from './lib/astro.js';
 import { Bus, api, feeds, store, toast, $, fmt } from './lib/util.js';
 import * as Astro from 'astronomy-engine';
 
@@ -36,6 +36,7 @@ class App {
     this.bus = new Bus();
     this.clock = new Clock();
     this.observer = new Observer(store.get('observer', DEFAULT_OBSERVER));
+    this.place = store.get('place', null);
     this.catalog = { objects: [], byId: new Map(), counts: new Array(CATEGORIES.length).fill(0), meta: null };
     this.state = null;
     this.selection = null;
@@ -110,14 +111,16 @@ class App {
 
   locate() {
     if (store.get('observer', null) || !navigator.geolocation) return;
+    const seq = this.obsSeq || 0;
     navigator.geolocation.getCurrentPosition(
-      (p) => this.setObserver({ lat: p.coords.latitude, lon: p.coords.longitude, alt: (p.coords.altitude || 0) / 1000, name: 'My location' }),
-      () => toast('Using Kennedy Space Center as the observer. Set your mount location with the pin button (top right).', 'warn', 7000),
+      (p) => { if ((this.obsSeq || 0) === seq) this.setObserver({ lat: p.coords.latitude, lon: p.coords.longitude, alt: (p.coords.altitude || 0) / 1000, name: 'My location' }); },
+      () => { if ((this.obsSeq || 0) === seq) toast('Using Kennedy Space Center as the observer. Set your mount location with the pin button (top right).', 'warn', 7000); },
       { timeout: 8000, maximumAge: 3600e3 },
     );
   }
 
   setObserver(o) {
+    this.obsSeq = (this.obsSeq || 0) + 1;
     this.observer.set(o);
     store.set('observer', { lat: o.lat, lon: o.lon, alt: o.alt || 0, name: o.name || '' });
     this.scene.setObserver(this.observer);
@@ -125,8 +128,91 @@ class App {
     this.prop?.postMessage(msg);
     this.analysis?.postMessage(msg);
     this.nightCache = null;
+    if (this.placeConjKey !== `${o.lat.toFixed(5)},${o.lon.toFixed(5)}`) { this.scene.clearPlaceOverlay(); this.placeConj = null; this.placeConjKey = null; }
     if (this.scene.mode === 'orbital' && !this.selection) this.scene.resetView();
     this.bus.emit('observer');
+  }
+
+  /* ───────────── place: what is above a location ───────────── */
+
+  goToPlace(p) {
+    this.place = { name: p.name, label: p.label || '', lat: p.lat, lon: p.lon };
+    store.set('place', this.place);
+    this.encSeq = (this.encSeq || 0) + 1;                     // cancel a replay that is still loading
+    if (this.encounter) this.closeEncounter(true);           // and return to live time
+    else if (!this.clock.isLive) this.clock.live();
+    this.select(null);
+    this.setObserver({ lat: p.lat, lon: p.lon, alt: 0, name: p.name });
+    this.scene.setMode('orbital');
+    this.scene.flyToSurface(0.95);
+    this.drawer.open('place');                               // renders the panel, which starts the conjunction scan
+    toast(`Showing the sky above ${p.name}. Passes, night-sky counts and the mount now use this location.`, '', 6000);
+  }
+
+  /** Upcoming high-interest conjunctions (SOCRATES), cached for 15 minutes. */
+  upcomingConjunctions() {
+    if (this.upcoming && Date.now() - this.upcoming.at < 15 * 60e3) return Promise.resolve(this.upcoming.data);
+    this.upcomingP ??= api('/api/socrates/upcoming?hours=48&minPc=1e-4&maxRange=1', { timeout: 420_000 })
+      .then(({ data }) => { this.upcoming = { at: Date.now(), data }; return data; })
+      .finally(() => { this.upcomingP = null; });
+    return this.upcomingP;
+  }
+
+  ensurePlaceConjunctions() {
+    const key = `${this.observer.lat.toFixed(5)},${this.observer.lon.toFixed(5)}`;
+    if (this.placeConjKey === key && this.placeConj && !this.placeConj.error && Date.now() - this.placeConj.at < 15 * 60e3) return;
+    if (this.placeBusy === key) return;
+    this.computePlaceConjunctions();
+  }
+
+  /**
+   * Which upcoming close approaches happen in the observer's sky: propagate one of the two objects to TCA with SGP4
+   * (they are within a few km of each other then) and keep encounters at least 10° above the horizon.
+   */
+  async computePlaceConjunctions() {
+    if (!this.catalog.objects.length) return;
+    const token = (this.placeToken = (this.placeToken || 0) + 1);
+    const obs = this.observer, key = `${obs.lat.toFixed(5)},${obs.lon.toFixed(5)}`;
+    this.placeBusy = key;
+    if (this.placeConjKey !== key) { this.placeConj = null; this.scene.clearPlaceOverlay(); }
+    this.bus.emit('place');
+    try {
+      const data = await this.upcomingConjunctions();
+      if (token !== this.placeToken) return;
+      const list = [];
+      let notLoaded = 0;
+      const cutoff = Date.now() - 60e3;
+      for (const [id1, id2, t, range, speed, prob, cls, dse1, dse2] of data.rows) {
+        if (t < cutoff) continue;
+        const o = this.catalog.byId.get(id1) || this.catalog.byId.get(id2);
+        if (!o) { notLoaded++; continue; }
+        const rec = this.satrec(o);
+        if (!rec) continue;
+        const date = new Date(t);
+        const r = propagate(rec, date);
+        if (!r || !r.position || typeof r.position !== 'object') continue;
+        const p = r.position, g = gstime(date);
+        const look = obs.lookEci([p.x, p.y, p.z], g);
+        if (look.el < 10) continue;
+        const geo = eciToGeodetic(p, g);
+        const sun = sunEci(t), sn = Math.hypot(...sun), su = [sun[0] / sn, sun[1] / sn, sun[2] / sn];
+        const d = p.x * su[0] + p.y * su[1] + p.z * su[2];
+        const lit = d >= 0 || (p.x - d * su[0]) ** 2 + (p.y - d * su[1]) ** 2 + (p.z - d * su[2]) ** 2 > RE * RE;
+        const sunEl = obs.lookEci(sun, g).el;
+        const n1 = data.names[id1]?.[0] ?? String(id1), n2 = data.names[id2]?.[0] ?? String(id2);
+        list.push({ id1, id2, n1, n2, t, range, speed, prob, cls, dse1, dse2, az: look.az, el: look.el, slantKm: look.range,
+          lat: degreesLat(geo.latitude), lon: degreesLong(geo.longitude), altKm: geo.height, lit, dark: sunEl < -6, observable: lit && sunEl < -6 });
+      }
+      if (token !== this.placeToken) return;
+      this.placeConj = { at: Date.now(), list, scanned: data.rows.length, matching: data.matching, truncated: data.truncated, notLoaded, hours: data.hours, publishedAt: data.publishedAt };
+      this.placeConjKey = key;
+      this.scene.setPlaceOverlay({ lat: obs.lat, lon: obs.lon, ringDeg: visibilityRadiusDeg(550, 10), conj: list });
+    } catch (e) {
+      if (token === this.placeToken) { this.placeConj = { at: Date.now(), error: e.message }; this.placeConjKey = null; this.scene.clearPlaceOverlay(); }
+    } finally {
+      if (token === this.placeToken) this.placeBusy = null;
+    }
+    this.bus.emit('place');
   }
 
   /* ───────────── catalogue ───────────── */
@@ -462,8 +548,10 @@ class App {
   /* ───────────── conjunction encounter view ───────────── */
 
   async viewEncounter({ id1, id2, tca, socrates = null }) {
+    const tok = (this.encSeq = (this.encSeq || 0) + 1);
     toast('Loading both objects and refining the encounter with SGP4…');
     const [a, b] = await Promise.all([this.ensureObject(id1), this.ensureObject(id2)]);
+    if (tok !== this.encSeq) return;
     if (!a || !b) { toast('One of the objects has no public orbital elements.', 'err'); return; }
     const ra = this.satrec(a), rb = this.satrec(b);
     const dist = (t) => {
@@ -505,6 +593,7 @@ class App {
   }
 
   closeEncounter(goLive = true) {
+    this.encSeq = (this.encSeq || 0) + 1;
     this.encounter = null;
     this.scene.setPair(-1, -1);
     this.scene.setPairLine(null);
@@ -626,6 +715,10 @@ class App {
       else if (hit.kind === 'moon') this.select({ kind: 'moon' });
       else if (hit.kind === 'event') this.select({ kind: 'event', obj: this.events[hit.i] });
       else if (hit.kind === 'earth') this.select({ kind: 'earth', lat: hit.lat, lon: hit.lon });
+      else if (hit.kind === 'conj') {
+        const c = this.placeConj?.list?.[hit.i];
+        if (c) this.viewEncounter({ id1: c.id1, id2: c.id2, tca: c.t, socrates: { rangeKm: c.range, maxProb: c.prob, speedKms: c.speed, dse1: c.dse1, dse2: c.dse2 } });
+      }
     });
     this.bus.on('focus', (hit) => {
       if (hit.kind === 'sat') this.focus({ kind: 'sat', obj: this.catalog.objects[hit.i] });

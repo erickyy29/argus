@@ -62,6 +62,11 @@
     </div>
 
     <div class="topbar-right">
+      <form class="place-search" id="placeForm" role="search" autocomplete="off">
+        <svg viewBox="0 0 20 20"><circle cx="8.8" cy="8.8" r="5.6"/><path d="m13 13 4.6 4.6"/></svg>
+        <input id="placeInput" type="search" placeholder="Go to a place… e.g. Scarborough Town Centre" aria-label="Go to a place" spellcheck="false">
+        <div class="place-results hidden" id="placeResults"></div>
+      </form>
       <button class="observer-btn" id="observerBtn" title="Observer / mount location">
         <svg viewBox="0 0 20 20"><path d="M10 18s6-5.6 6-10a6 6 0 1 0-12 0c0 4.4 6 10 6 10Z"/><circle cx="10" cy="8" r="2.2"/></svg>
         <span id="observerLabel" class="mono">Locating…</span>
@@ -73,6 +78,7 @@
   </header>
 
   <nav class="rail" aria-label="Panels">
+    <button data-tab="place" title="Location — what is above a place, and the close approaches in its sky"><svg viewBox="0 0 20 20"><path d="M10 18s6-5.6 6-10a6 6 0 1 0-12 0c0 4.4 6 10 6 10Z"/><circle cx="10" cy="8" r="2.2"/></svg><span>Location</span></button>
     <button data-tab="catalog" title="Catalog & layers"><svg viewBox="0 0 20 20"><path d="M10 2.5 2.5 6.5 10 10.5l7.5-4L10 2.5Z"/><path d="m2.5 10 7.5 4 7.5-4"/><path d="m2.5 13.5 7.5 4 7.5-4"/></svg><span>Catalog</span></button>
     <button data-tab="risk" title="Collision risk"><svg viewBox="0 0 20 20"><ellipse cx="10" cy="10" rx="8" ry="3.2" transform="rotate(28 10 10)"/><ellipse cx="10" cy="10" rx="8" ry="3.2" transform="rotate(-28 10 10)"/><circle cx="10" cy="10" r="1.4" class="fill"/></svg><span>Risk</span></button>
     <button data-tab="environment" title="Orbital environment & sustainability"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="4.2"/><ellipse cx="10" cy="10" rx="8.6" ry="3.1"/><path d="M5.9 8.6c2.4.6 5.6.6 8.2 0"/></svg><span>Environ.</span></button>

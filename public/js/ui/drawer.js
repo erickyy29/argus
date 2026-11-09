@@ -5,9 +5,10 @@ import { BRIEF } from '../lib/briefs.js';
 import { twilight, moonInfo, bodyHorizon, enuDir, DEG } from '../lib/astro.js';
 import { formatLifetime, lifetimeYears } from '../lib/lifetime.js';
 import { drawChart } from './charts.js';
+import { attachPlaceSearch } from './placesearch.js';
 import * as Astro from 'astronomy-engine';
 
-const TITLES = { catalog: 'Catalog & layers', risk: 'Collision risk', environment: 'Orbital environment', sky: 'Night-sky impact', neo: 'Near-Earth asteroids', earth: 'Space weather & Earth events', mount: 'Tracking mount', search: 'Search' };
+const TITLES = { place: 'Location overview', catalog: 'Catalog & layers', risk: 'Collision risk', environment: 'Orbital environment', sky: 'Night-sky impact', neo: 'Near-Earth asteroids', earth: 'Space weather & Earth events', mount: 'Tracking mount', search: 'Search' };
 const CLASS = [
   { key: 'same', label: 'Same operator', color: '#5b6b86', hint: 'Identified fleets only; the operator sees its own fleet more accurately than public data' },
   { key: 'cross', label: 'Cross-operator', color: '#4ea8ff', hint: 'Two operators must share data and coordinate' },
@@ -35,20 +36,22 @@ export class Drawer {
     $('#drawerClose').addEventListener('click', () => this.close());
     const re = (tabs) => () => { if (tabs.includes(this.tab)) this.render(); };
     app.bus.on('catalog', (d) => {
+      this.riskSet = null;
       if (d?.reload) { this.night = null; this.bright = null; }
       if (['catalog', 'search', 'risk', 'sky'].includes(this.tab)) this.render();
     });
     app.bus.on('layers', re(['catalog']));
     app.bus.on('options', re(['catalog', 'neo']));
     app.bus.on('socrates', re(['risk', 'environment']));
-    app.bus.on('risky', re(['risk']));
+    app.bus.on('risky', () => { this.riskSet = null; if (this.tab === 'risk') this.render(); });
+    app.bus.on('place', () => { if (this.tab === 'place') this.renderPlaceConj(); });
     app.bus.on('environment', re(['environment']));
     app.bus.on('neo:list', re(['neo']));
     app.bus.on('neo:cad', re(['neo']));
     app.bus.on('neo:elements', () => { if (this.tab === 'neo') { clearTimeout(this.neoT); this.neoT = setTimeout(() => this.render(), 600); } });
-    app.bus.on('events', re(['earth']));
+    app.bus.on('events', () => { if (this.tab === 'earth') this.render(); else if (this.tab === 'place') { const h = $('#plEvents'); if (h) h.innerHTML = this.placeEventsHtml(); } });
     app.bus.on('spaceweather', re(['earth']));
-    app.bus.on('observer', () => { this.night = null; this.bright = null; if (['sky', 'mount'].includes(this.tab)) this.render(); });
+    app.bus.on('observer', () => { this.night = null; this.bright = null; if (['sky', 'mount', 'place'].includes(this.tab)) this.render(); });
     app.bus.on('mount:change', re(['mount']));
     app.bus.on('view', re(['mount']));
     app.bus.on('mount:log', () => { const l = $('#mountLog'); if (l) { l.textContent = this.app.mount.log.join('\n'); l.scrollTop = l.scrollHeight; } });
@@ -74,13 +77,134 @@ export class Drawer {
   }
   render() {
     if (!this.tab) return;
-    const fn = { catalog: this.renderCatalog, risk: this.renderRisk, environment: this.renderEnvironment, sky: this.renderSky, neo: this.renderNeo, earth: this.renderEarth, mount: this.renderMount, search: this.renderSearch }[this.tab];
+    const fn = { place: this.renderPlace, catalog: this.renderCatalog, risk: this.renderRisk, environment: this.renderEnvironment, sky: this.renderSky, neo: this.renderNeo, earth: this.renderEarth, mount: this.renderMount, search: this.renderSearch }[this.tab];
     try { fn.call(this); } catch (e) { console.error(e); this.body.innerHTML = `<div class="err">Panel error: ${esc(e.message)}</div>`; }
   }
   /** 4 Hz live refresh for the open tab. */
   tick() {
+    if (this.tab === 'place') {
+      this.updatePlaceLive();
+      if (Date.now() - (this.plConjAt || 0) > 30e3) { this.app.ensurePlaceConjunctions(); this.renderPlaceConj(); }
+    }
     if (this.tab === 'sky') this.updateSkyNow();
     if (this.tab === 'mount') this.updateMountLive();
+  }
+
+  /* ═════════════════════ Location ═════════════════════ */
+  currentPlace() {
+    const app = this.app, o = app.observer, p = app.place;
+    if (p && Math.abs(p.lat - o.lat) < 1e-6 && Math.abs(p.lon - o.lon) < 1e-6) return p;
+    return { name: o.name || 'Observer', label: '', lat: o.lat, lon: o.lon };
+  }
+
+  renderPlace() {
+    const app = this.app, o = app.observer, P = this.currentPlace(), t = app.clock.now();
+    const sun = bodyHorizon(Astro.Body.Sun, t, o), nw = app.nightWindow();
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+    this.body.innerHTML = `
+      <p class="lead">Search any place to see what is above it right now, and which close approaches between satellites and debris will happen in its sky.</p>
+      <form class="place-search inpanel" id="pf" role="search" autocomplete="off">
+        <svg viewBox="0 0 20 20"><circle cx="8.8" cy="8.8" r="5.6"/><path d="m13 13 4.6 4.6"/></svg>
+        <input id="pfi" type="search" placeholder="Place, address or lat, lon — press Enter" spellcheck="false">
+        <div class="place-results hidden" id="pfr"></div>
+      </form>
+      <div class="section">
+        <div class="section-title">${esc(P.name)} <span class="src">${fmt.lat(P.lat)} ${fmt.lon(P.lon)}</span></div>
+        ${P.label && P.label !== P.name ? `<p class="note" style="margin:-4px 0 8px">${esc(P.label)}</p>` : ''}
+        ${P.label && P.label !== 'Coordinates' ? '<p class="note" style="margin:0 0 8px">Place data <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a></p>' : ''}
+        <div class="kv">
+          <div class="k">Sky now</div><div class="v">${twilight(sun.el)} · Sun ${fmt.deg(sun.el, 1)}</div>
+          <div class="k">Next dark window</div><div class="v">${nw ? `${fmt.localFull(nw.start)} → ${fmt.local(nw.end)}` : '—'}<br><small>times in ${esc(tz)}</small></div>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn small" id="plFly">Fly there</button><button class="btn small" id="plLook">Look up from here</button>
+          <button class="btn small" data-goto="sky">Night-sky impact</button><button class="btn small" data-goto="mount">Point the mount</button>
+        </div>
+      </div>
+      <div class="section"><div class="section-title">Overhead right now <span class="src">live SGP4</span></div>
+        <div class="kpis" id="plNow"></div><div class="list" id="plOver" style="margin-top:8px"></div></div>
+      <div class="section"><div class="section-title">Close approaches in this sky <span class="src" id="plConjSrc">next 48 h · above 10°</span></div>
+        <div id="plConj"></div></div>
+      <div class="section"><div class="section-title">Natural events within 1,000 km <span class="src">NASA EONET</span></div>
+        <div class="list" id="plEvents">${this.placeEventsHtml()}</div></div>
+      <details class="method"><summary>How this is worked out</summary><div class="body">
+        <p>Close approaches come from the CelesTrak SOCRATES report: upcoming encounters with a worst-case Max Pc of at least 1e-4, or a predicted miss under 1 km, between different operators or between an active satellite and a dead object. For each one, the latest orbital elements are propagated with SGP4 to the time of closest approach to find where in the sky it happens. Encounters at least 10° above this place's horizon are listed and marked ✕ on the globe; click a marker or a row to replay it in 3D.</p>
+        <p>The blue ring is drawn at 550 km altitude and marks where an object at that height appears more than 10° above this place's horizon; each ✕ hangs at the encounter's real altitude, with a faint line down to the ground point below it. “Observable” means the encounter point is sunlit while the sky here is dark (Sun below −6°), so a camera could catch both objects.</p>
+        <p>Place search: © OpenStreetMap contributors, via Nominatim. Choosing a place also moves the observer and mount location to it.</p>
+      </div></details>`;
+    attachPlaceSearch({ form: $('#pf'), input: $('#pfi'), results: $('#pfr'), app });
+    this.plKey = null;
+    this.renderPlaceConj();
+    this.updatePlaceLive();
+    app.ensurePlaceConjunctions();
+    this.body.onclick = (e) => {
+      if (e.target.id === 'plFly') return app.scene.flyToSurface(0.95);
+      if (e.target.id === 'plLook') { app.scene.setMode('sky'); return; }
+      if (e.target.id === 'plRetry') { app.computePlaceConjunctions(); return; }
+      if (e.target.id === 'plMarkers') { app.scene.setPlaceOverlayVisible(!(app.scene.placeOverlayVisible ?? true)); this.renderPlaceConj(); return; }
+      const go = e.target.closest('[data-goto]'); if (go) return this.open(go.dataset.goto);
+      const cj = e.target.closest('[data-cj]');
+      if (cj) { const c = app.placeConj?.list?.[Number(cj.dataset.cj)]; if (c) app.viewEncounter({ id1: c.id1, id2: c.id2, tca: c.t, socrates: { rangeKm: c.range, maxProb: c.prob, speedKms: c.speed, dse1: c.dse1, dse2: c.dse2 } }); return; }
+      const ov = e.target.closest('[data-sel-i]'); if (ov) { app.select({ kind: 'sat', obj: app.catalog.objects[Number(ov.dataset.selI)] }); return; }
+      const ev = e.target.closest('[data-ev-id]');
+      if (ev) { const obj = (app.events || []).find((x) => x.id === ev.dataset.evId); if (obj) app.select({ kind: 'event', obj }); return; }
+      if (e.target.id === 'plAll') { this.plConjAll = !this.plConjAll; this.renderPlaceConj(); }
+    };
+  }
+
+  placeEventsHtml() {
+    const o = this.app.observer;
+    const near = (this.app.events || []).map((e) => ({ e, d: gcKm(o.lat, o.lon, e.lat, e.lon) })).filter((x) => x.d < 1000).sort((a, b) => a.d - b.d);
+    return near.length ? near.slice(0, 8).map(({ e, d }) => `<div class="row cols" data-ev-id="${esc(e.id)}"><div style="min-width:0"><div class="t"><span class="sw" style="background:${EONET_COLORS[e.cat] || '#ccc'};border-radius:2px"></span>${esc(e.title)}</div><div class="m">${esc(e.catTitle)} · ${fmt.age(e.date)}</div></div><div class="r">${fmt.int(d)} km</div></div>`).join('')
+      : '<div class="empty">No open natural events within 1,000 km.</div>';
+  }
+
+  renderPlaceConj() {
+    const host = $('#plConj'); if (!host) return;
+    this.plConjAt = Date.now();   // tick() refreshes (and retries after an error) at most every 30 s
+    const app = this.app, pc = app.placeConj, now = app.clock.now();
+    if (!pc) { host.innerHTML = '<div class="empty">Finding the close approaches that happen above this place…</div>'; return; }
+    if (pc.error) { host.innerHTML = `<div class="callout danger">Couldn't load conjunction data: ${esc(pc.error)} <button class="btn small" id="plRetry">Retry</button></div>`; return; }
+    const live = pc.list.map((c, i) => [c, i]).filter(([c]) => c.t >= Date.now() - 60e3);
+    const L = live.map(([c]) => c), risky = L.filter((c) => c.prob >= PC_RED).length, obs = L.filter((c) => c.observable).length;
+    const rows = this.plConjAll ? live : live.slice(0, 40);
+    const shown = app.scene.placeOverlayVisible ?? true;
+    const src = $('#plConjSrc'); if (src) src.textContent = `next ${pc.hours} h · above 10° · SOCRATES ${fmt.age(pc.publishedAt)}`;
+    host.innerHTML = `
+      <div class="kpis three">${kpi(fmt.int(L.length), 'In this sky', `of ${fmt.int(pc.scanned)} upcoming encounters`)}${kpi(fmt.int(risky), 'Max Pc ≥ 10⁻⁴', 'worst case', risky ? 'alert' : '')}${kpi(fmt.int(obs), 'Observable', 'sunlit, dark sky here', obs ? 'good' : '')}</div>
+      <p class="note">${pc.notLoaded ? `${fmt.int(pc.notLoaded)} encounters between two objects outside the loaded catalogue could not be placed. ` : ''}${pc.truncated ? `Only the first ${fmt.int(pc.scanned)} of ${fmt.int(pc.matching)} encounters were checked. ` : ''}✕ markers on the globe show where each one happens. <button class="btn small" id="plMarkers">${shown ? 'Hide' : 'Show'} markers</button></p>
+      <div class="list" style="margin-top:8px">${L.length ? rows.map(([c, i]) => `<div class="row conj" data-cj="${i}" title="Replay this encounter in 3D">
+          <div class="pc ${c.prob >= PC_RED ? 'p4' : c.prob >= PC_AMBER ? 'p5' : 'p6'}">${fmt.pc(c.prob)}</div>
+          <div style="min-width:0"><div class="t pair"><span class="n">${esc(c.n1)}</span><span class="x">↔</span><span class="n">${esc(c.n2)}</span></div>
+            <div class="m">${fmt.localFull(c.t)} · ${fmt.rel(c.t, now)} · ${compass(c.az)} ${fmt.deg(c.el, 0)} · ${fmt.int(c.altKm)} km up${c.observable ? ' · <span class="badge obs">observable</span>' : ''}</div></div>
+          <div class="r">${fmt.km(c.range)}<br><span style="color:var(--text-3)">${fmt.speed(c.speed)}</span></div></div>`).join('')
+        : '<div class="empty">No high-interest close approaches above 10° in this sky in the next 48 hours.</div>'}</div>
+      ${L.length > 40 ? `<p class="note">${this.plConjAll ? `Showing all ${fmt.int(L.length)}.` : `Showing the first 40 of ${fmt.int(L.length)} (soonest first).`} <button class="btn small" id="plAll">${this.plConjAll ? 'Show fewer' : 'Show all'}</button></p>` : ''}`;
+  }
+
+  /** Live counts for the Location tab (4 Hz); the list is rebuilt only when its membership changes. */
+  updatePlaceLive() {
+    const app = this.app, s = app.state, host = $('#plNow');
+    if (!host || !s) return;
+    if (!this.riskSet) this.riskSet = new Set(app.scene.riskIdx || []);
+    let up = 0, up30 = 0, lit = 0, risk = 0;
+    const top = [];
+    for (let i = 0; i < s.n; i++) {
+      const el = s.el[i];
+      if (!(el > 0)) continue;
+      up++;
+      if (el >= 30) up30++;
+      if (el >= 10 && s.st[i] === 2) lit++;
+      if (this.riskSet.has(i)) risk++;
+      if (top.length < 6 || el > top[top.length - 1][1]) { top.push([i, el]); top.sort((a, b) => b[1] - a[1]); if (top.length > 6) top.pop(); }
+    }
+    host.innerHTML = kpi(fmt.int(up), 'Above the horizon', `${fmt.int(up30)} higher than 30°`) + kpi(fmt.int(lit), 'Sunlit above 10°', s.sunEl < -6 ? 'visible against a dark sky' : 'sky too bright to see them')
+      + kpi(fmt.int(risk), 'In a high-risk encounter', 'pulsing red on the globe', risk ? 'alert' : '');
+    const key = top.map(([i]) => i).join(',');
+    if (key === this.plKey) return;
+    this.plKey = key;
+    const list = $('#plOver');
+    if (list) list.innerHTML = top.map(([i, el]) => { const o = app.catalog.objects[i]; return `<div class="row cols" data-sel-i="${i}"><div style="min-width:0"><div class="t"><span class="sw" style="background:${CATEGORIES[o.cat].color}"></span>${esc(o.name)}</div><div class="m">${CATEGORIES[o.cat].short} · ${compass(s.az[i])} · ${fmt.km(s.rng[i])} away</div></div><div class="r">${fmt.deg(el, 0)}</div></div>`; }).join('');
   }
 
   /* ═════════════════════ Catalog ═════════════════════ */
@@ -678,6 +802,10 @@ POS &lt;az°&gt; &lt;el°&gt; · PONG · HELLO …   (mount → host)</pre>
 const lifetimeAt = (h) => lifetimeYears(h, h);
 
 function compass(az) { return ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(az / 45) % 8]; }
+function gcKm(la1, lo1, la2, lo2) {
+  const a = la1 * DEG, b = la2 * DEG, d = (lo2 - lo1) * DEG;
+  return 6371 * Math.acos(Math.min(1, Math.sin(a) * Math.sin(b) + Math.cos(a) * Math.cos(b) * Math.cos(d)));
+}
 function flareClass(f) {
   const cls = f >= 1e-4 ? ['X', 1e-4] : f >= 1e-5 ? ['M', 1e-5] : f >= 1e-6 ? ['C', 1e-6] : f >= 1e-7 ? ['B', 1e-7] : ['A', 1e-8];
   return `${cls[0]}${(Math.floor((f / cls[1]) * 10) / 10).toFixed(1)}`;

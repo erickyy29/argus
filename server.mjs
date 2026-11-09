@@ -29,11 +29,13 @@ loadDotEnv(path.join(ROOT, '.env'));
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || '127.0.0.1';
-const UA = 'ARGUS-Orbital-Console/1.0 (local research dashboard; Node.js)';
+const UA = 'ARGUS-Orbital-Console/1.0 (+https://github.com/erickyy29/argus)';   // identifies the app to upstream services
 const MIN = 60_000, HOUR = 60 * MIN, DAY = 24 * HOUR;
 const JSON_TYPE = 'application/json; charset=utf-8';
 
 const nasa = { key: (process.env.NASA_API_KEY || '').trim() || 'DEMO_KEY' };
+// Place search: the public OSM Nominatim by default; point NOMINATIM_URL at your own instance for heavy traffic.
+const NOMINATIM_URL = (process.env.NOMINATIM_URL || 'https://nominatim.openstreetmap.org').trim().replace(/\/+$/, '');
 nasa.status = nasa.key === 'DEMO_KEY' ? 'demo' : 'unverified';
 
 function loadDotEnv(file) {
@@ -75,9 +77,26 @@ const LIMITERS = {
   'ssd.jpl.nasa.gov': new Limiter(1, 400),
   'api.nasa.gov': new Limiter(1, 500),
   'tle.ivanstanojevic.me': new Limiter(2, 150),
+  'nominatim.openstreetmap.org': new Limiter(1, 1100),   // OSM Nominatim policy: at most 1 request per second
   'api.wheretheiss.at': new Limiter(1, 1100),     // ~1 request/second limit
 };
 const DEFAULT_LIMITER = new Limiter(6);
+const hostCooldown = new Map();   // host → { until, message }  (set when a host with opt.cooldown answers 429/403)
+function retryAfterMs(v) {
+  if (!v) return null;
+  const s = Number(v);
+  if (Number.isFinite(s)) return Math.max(0, s * 1000);
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? Math.max(0, t - Date.now()) : null;
+}
+/** Fail fast (without marking the key as failed) while a host is cooling down or its queue is full. */
+function hostBusy(host, limiter, opt) {
+  const cd = hostCooldown.get(host);
+  if (cd && Date.now() < cd.until) return new HttpError(503, `${cd.message} Try again in about ${Math.max(1, Math.ceil((cd.until - Date.now()) / 60_000))} min.`);
+  if (cd) hostCooldown.delete(host);
+  if (opt.maxQueue != null && limiter.queue.length + limiter.active >= opt.maxQueue) return new HttpError(503, opt.busyMessage || `${host} is busy; try again shortly.`);
+  return null;
+}
 
 /* ──────────────────────────────── cache layer ──────────────────────────────── */
 
@@ -159,6 +178,8 @@ async function getCached(key, url, opt = {}) {
 async function refresh(key, url, prev, opt) {
   const host = new URL(url).hostname;
   const limiter = LIMITERS[host] || DEFAULT_LIMITER;
+  const busy = hostBusy(host, limiter, opt);
+  if (busy) { if (prev) return { entry: prev, cache: 'STALE' }; throw busy; }
   const t0 = Date.now();
   try {
     const result = await limiter.run(async () => {
@@ -176,7 +197,19 @@ async function refresh(key, url, prev, opt) {
       return { entry: prev, cache: 'REVALIDATED' };
     }
     const { res, body } = result;
-    if (!res.ok) throw new HttpError(res.status, `${host} responded ${res.status}: ${snippet(body)}`);
+    if (!res.ok) {
+      if (opt.cooldown && (res.status === 429 || res.status === 403)) {
+        const wait = retryAfterMs(res.headers.get('retry-after')) ?? (res.status === 429 ? 2 * MIN : 30 * MIN);
+        hostCooldown.set(host, { until: Date.now() + Math.min(wait, 6 * HOUR), message: opt.cooldown });
+        const err = new HttpError(503, `${opt.cooldown} Try again in about ${Math.max(1, Math.ceil(wait / MIN))} min.`);
+        err.detail = `${host} responded ${res.status}: ${snippet(body)}`;
+        throw err;
+      }
+      // upstream body kept for the server log only; clients get a clean message
+      const err = new HttpError(res.status, `${host} responded ${res.status}`);
+      err.detail = snippet(body);
+      throw err;
+    }
     opt.validate?.(body, res);
     const stored = opt.transform ? opt.transform(body) : body;
     const entry = {
@@ -192,7 +225,7 @@ async function refresh(key, url, prev, opt) {
     const message = err.name === 'TimeoutError' ? `${host} timed out` : err.message;
     failures.set(key, { at: Date.now(), message });
     noteFeed(opt.feed, false, message);
-    log(`✗ ${host} ${key} — ${message}${prev ? ' (serving last good copy)' : ''}`);
+    log(`✗ ${host} ${key} — ${message}${err.detail ? ` — ${err.detail}` : ''}${prev ? ' (serving last good copy)' : ''}`);
     if (prev) return { entry: prev, cache: 'STALE' };
     throw err instanceof HttpError ? err : new HttpError(502, message);
   }
@@ -219,12 +252,13 @@ const COMPRESSIBLE = /json|text|javascript|csv|xml|svg/;
  */
 const CDN_POLICY = [
   [/^\/vendor\//, 31536000, 86400], [/^\/api\/gibs\//, 86400, 3600], [/^\/api\/(sbdb|images|epic-image)/, 86400, 3600],
-  [/^\/api\/(environment|satcat)/, 3600, 300], [/^\/api\/(catalog|socrates|neo|cad|horizons|tle|gp|gp-catnr|epic|sentry)/, 1800, 120],
-  [/^\/api\/eonet/, 600, 120], [/^\/api\/swpc\//, 60, 30], [/^\/api\/iss$/, 4, 0],
+  [/^\/api\/(environment|satcat)/, 3600, 300], [/^\/api\/socrates\/upcoming$/, 300, 60, 300],
+  [/^\/api\/(catalog|socrates|neo|cad|horizons|tle|gp|gp-catnr|epic|sentry)/, 1800, 120],
+  [/^\/api\/eonet/, 600, 120], [/^\/api\/swpc\//, 60, 30], [/^\/api\/iss$/, 4, 0], [/^\/api\/geocode$/, 604800, 86400],
 ];
 function cdnCacheControl(pathname) {
-  for (const [re, sMax, browser] of CDN_POLICY) {
-    if (re.test(pathname)) return `public, max-age=${browser}, s-maxage=${sMax}, stale-while-revalidate=${Math.max(30, sMax * 4)}`;
+  for (const [re, sMax, browser, swr] of CDN_POLICY) {
+    if (re.test(pathname)) return `public, max-age=${browser}, s-maxage=${sMax}, stale-while-revalidate=${swr ?? Math.max(30, sMax * 4)}`;
   }
   return null;
 }
@@ -776,6 +810,59 @@ route(/^\/api\/socrates\/top$/, async (req, res, m, q) => {
   sendJson(req, res, 200, { summary: db.summary, filter, sort, matching, rows: live.map((i) => socratesRow(db, i)) }, { 'x-fetched-at': db.summary.fetchedAt });
 });
 
+/**
+ * Upcoming conjunctions of interest (compact rows), so the browser can work out which ones happen in the sky
+ * above a chosen place. Kept: Max Pc ≥ minPc OR miss ≤ maxRange km; same-operator pairs only with same=1.
+ */
+route(/^\/api\/socrates\/upcoming$/, async (req, res, m, q) => {
+  const db = await ensureSocrates();
+  const hours = Math.min(168, Math.max(1, Number(q.get('hours')) || 48));
+  const minPc = Math.min(1, Math.max(1e-8, Number(q.get('minPc')) || 1e-4));
+  const maxRange = Math.min(5, Math.max(0, Number(q.get('maxRange')) || 1));
+  const same = q.get('same') === '1';
+  const now = Date.now(), end = now + hours * HOUR, CAP = 8000;
+  const idx = [];
+  for (let i = 0; i < db.n; i++) {
+    if (db.docked[i] || (!same && db.cls[i] === 0)) continue;
+    const t = db.cols.tca[i];
+    if (t < now - 10 * MIN || t > end) continue;
+    if (db.cols.prob[i] < minPc && db.cols.range[i] > maxRange) continue;
+    idx.push(i);
+  }
+  idx.sort((a, b) => db.cols.tca[a] - db.cols.tca[b]);
+  const names = {};
+  const rows = idx.slice(0, CAP).map((i) => {
+    const a = db.cols.id1[i], b = db.cols.id2[i];
+    names[a] ??= db.names.get(a); names[b] ??= db.names.get(b);
+    return [a, b, db.cols.tca[i], db.cols.range[i], db.cols.speed[i], db.cols.prob[i], db.cls[i], db.cols.dse1[i], db.cols.dse2[i]];
+  });
+  sendJson(req, res, 200, {
+    hours, minPc, maxRangeKm: maxRange, includeSameOperator: same, matching: idx.length, truncated: Math.max(0, idx.length - CAP),
+    publishedAt: db.summary.publishedAt, fields: ['id1', 'id2', 'tcaMs', 'rangeKm', 'speedKms', 'maxProb', 'cls', 'dse1', 'dse2'], names, rows,
+  }, { 'x-fetched-at': db.summary.fetchedAt });
+});
+
+/**
+ * Place search via OpenStreetMap Nominatim. Usage policy: ≤ 1 request/s (limiter above), an identifying User-Agent,
+ * results cached (30 days here, 7 days at the CDN), and no search-as-you-type — the client only searches on submit.
+ * At most 12 lookups wait in the queue; a 429/403 pauses lookups for Retry-After (or 2 / 30 min).
+ */
+route(/^\/api\/geocode$/, async (req, res, m, q) => {
+  const s = (q.get('q') || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+  if (s.length < 2) throw new HttpError(400, 'query too short');
+  const params = new URLSearchParams({ q: s, format: 'jsonv2', limit: '6', 'accept-language': 'en' });
+  const r = await getCached(`geocode:${s.toLowerCase()}`, `${NOMINATIM_URL}/search?${params}`, {
+    ttl: 30 * DAY, retryAfter: MIN, validate: validJsonArray, type: JSON_TYPE, feed: 'osm-nominatim', timeout: 20_000,
+    maxQueue: 12, busyMessage: 'Place search is busy (OpenStreetMap allows one lookup per second). Try again in a few seconds, or type coordinates such as 43.776, -79.258.',
+    cooldown: 'Place search is paused because OpenStreetMap asked us to slow down. You can still type coordinates such as 43.776, -79.258.',
+  });
+  const results = JSON.parse(r.entry.body.toString('utf8')).map((p) => ({
+    name: p.name || String(p.display_name || '').split(',')[0], label: p.display_name, lat: Number(p.lat), lon: Number(p.lon),
+    kind: [p.category, p.type].filter(Boolean).join(' · '), importance: p.importance ?? 0,
+  })).filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+  sendJson(req, res, 200, { query: s, attribution: '© OpenStreetMap contributors (ODbL) · search by Nominatim', results }, meta(r));
+});
+
 /** Objects in external (cross-operator or active↔derelict) encounters with Max Pc ≥ minPc in the next `hours`. */
 route(/^\/api\/socrates\/risky$/, async (req, res, m, q) => {
   const db = await ensureSocrates();
@@ -825,7 +912,7 @@ async function nasaGet(key, pathAndQuery, opt) {
     if (nasa.status === 'unverified' && r.cache === 'MISS') nasa.status = 'valid';
     return r;
   } catch (e) {
-    if (e.status === 403 && /API_KEY_INVALID/.test(e.message) && nasa.key !== 'DEMO_KEY') {
+    if (e.status === 403 && /API_KEY_INVALID/.test(e.detail || e.message) && nasa.key !== 'DEMO_KEY') {
       log('NASA API key rejected (API_KEY_INVALID) — falling back to DEMO_KEY');
       nasa.key = 'DEMO_KEY'; nasa.status = 'invalid'; failures.delete(key);
       return attempt();
@@ -1031,7 +1118,8 @@ export async function handler(req, res) {
     await serveStatic(req, res, url.pathname);
   } catch (err) {
     const status = err.status || 500;
-    if (status >= 500 && status !== 502) log(`! ${url.pathname}: ${err.stack || err.message}`);
+    if (status === 503) log(`! ${url.pathname}: ${err.message}`);   // expected back-pressure (busy / rate-limit pause)
+    else if (status >= 500 && status !== 502) log(`! ${url.pathname}: ${err.stack || err.message}`);
     if (!res.headersSent) sendJson(req, res, status, { error: err.message });
     else res.end();
   }
