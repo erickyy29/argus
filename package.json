@@ -1,0 +1,13 @@
+{
+  "name": "argus-orbital-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Real-time orbital situational awareness: satellites, debris, conjunctions, near-Earth asteroids, sky impact and pointing for a robotic tracking mount.",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
